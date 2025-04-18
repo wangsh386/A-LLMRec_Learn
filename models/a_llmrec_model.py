@@ -1,355 +1,285 @@
-import random
-import pickle
-import torch
-from torch.cuda.amp import autocast as autocast
-import torch.nn as nn
-import numpy as np
-from models.recsys_model import *
-from models.llm4rec import *
-from sentence_transformers import SentenceTransformer
+# 导入必要的库
+import random  # 用于随机数生成
+import pickle  # 用于序列化和反序列化Python对象
+import torch  # PyTorch深度学习框架
+from torch.cuda.amp import autocast as autocast  # 混合精度训练
+import torch.nn as nn  # 神经网络模块
+import numpy as np  # 数值计算库
+from models.recsys_model import *  # 推荐系统模型
+from models.llm4rec import *  # 推荐系统LLM模块
+from sentence_transformers import SentenceTransformer  # 文本嵌入模型
 
-# 定义一个两层的多层感知机(MLP)
+# 定义两层的多层感知机
 class two_layer_mlp(nn.Module):
+    """双层MLP网络，用于特征转换和匹配"""
     def __init__(self, dims):
+        """
+        Args:
+            dims (int): 输入特征的维度
+        """
         super().__init__()
-        self.fc1 = nn.Linear(dims, 128)  # 第一层，输入为dims，输出为128维
-        self.fc2 = nn.Linear(128, dims)  # 第二层，输入为128维，输出为dims维
-        self.sigmoid = nn.Sigmoid()  # Sigmoid激活函数
+        # 第一全连接层：dims -> 128
+        self.fc1 = nn.Linear(dims, 128)
+        # 第二全连接层：128 -> dims
+        self.fc2 = nn.Linear(128, dims)
+        # Sigmoid激活函数
+        self.sigmoid = nn.Sigmoid()
         
     def forward(self, x):
-        x = self.fc1(x)  # 通过第一层
+        """前向传播过程"""
+        x = self.fc1(x)  # 第一层线性变换
         x = self.sigmoid(x)  # 激活函数
-        x1 = self.fc2(x)  # 通过第二层
-        return x, x1
+        x1 = self.fc2(x)  # 第二层线性变换
+        return x, x1  # 返回中间层和最终输出
 
-# A-LLMRec模型
 class A_llmrec_model(nn.Module):
+    """A-LLMRec推荐系统主模型"""
     def __init__(self, args):
+        """
+        Args:
+            args (argparse.Namespace): 包含模型配置的参数对象
+        """
         super().__init__()
-        rec_pre_trained_data = args.rec_pre_trained_data
+        # 初始化基础配置
+        rec_pre_trained_data = args.rec_pre_trained_data  # 预训练数据名称
         self.args = args
-        self.device = args.device
-        
-        # 读取商品文本名称字典
+        self.device = args.device  # 计算设备（CPU/GPU）
+
+        # 加载商品文本信息字典
         with open(f'./data/amazon/{args.rec_pre_trained_data}_text_name_dict.json.gz','rb') as ft:
-            self.text_name_dict = pickle.load(ft)
-        
-        # 加载推荐系统模块
+            self.text_name_dict = pickle.load(ft)  # 包含商品标题和描述的字典
+
+        # 初始化推荐系统模块
         self.recsys = RecSys(args.recsys, rec_pre_trained_data, self.device)
-        self.item_num = self.recsys.item_num  # 商品数量
-        self.rec_sys_dim = self.recsys.hidden_units  # 推荐系统的隐藏层维度
-        self.sbert_dim = 768  # 使用Sentence-BERT的嵌入维度
-        
-        # MLP用于处理推荐系统的嵌入
+        self.item_num = self.recsys.item_num  # 商品总数
+        self.rec_sys_dim = self.recsys.hidden_units  # 推荐系统嵌入维度
+        self.sbert_dim = 768  # Sentence-BERT的嵌入维度
+
+        # 初始化MLP用于推荐系统嵌入处理
         self.mlp = two_layer_mlp(self.rec_sys_dim)
-        
-        # 如果开启了预训练阶段1
+
+        # 预训练阶段1的初始化
         if args.pretrain_stage1:
-            self.sbert = SentenceTransformer('nq-distilbert-base-v1')  # 加载Sentence-BERT模型
-            self.mlp2 = two_layer_mlp(self.sbert_dim)  # 第二个MLP，用于文本嵌入
-        
+            self.sbert = SentenceTransformer('nq-distilbert-base-v1')  # 文本嵌入模型
+            self.mlp2 = two_layer_mlp(self.sbert_dim)  # 文本嵌入处理MLP
+
+        # 损失函数和评估指标初始化
         self.mse = nn.MSELoss()  # 均方误差损失
-        
-        self.maxlen = args.maxlen  # 最大序列长度
-        self.NDCG = 0
-        self.HIT = 0
-        self.rec_NDCG = 0
-        self.rec_HIT = 0
-        self.lan_NDCG = 0
-        self.lan_HIT = 0
-        self.num_user = 0
-        self.yes = 0
-        
+        self.maxlen = args.maxlen  # 序列最大长度
+        self.NDCG = 0  # 标准化折损累计增益
+        self.HIT = 0   # 命中率
         self.bce_criterion = torch.nn.BCEWithLogitsLoss()  # 二元交叉熵损失
-        
-        # 如果开启了预训练阶段2或者推理模式
+
+        # 预训练阶段2或推理阶段的初始化
         if args.pretrain_stage2 or args.inference:
-            self.llm = llm4rec(device=self.device, llm_model=args.llm)  # 加载LLM模型
-            
-            # 用户日志嵌入投影层
+            self.llm = llm4rec(device=self.device, llm_model=args.llm)  # 大语言模型
+
+            # 用户行为日志嵌入投影层
             self.log_emb_proj = nn.Sequential(
                 nn.Linear(self.rec_sys_dim, self.llm.llm_model.config.hidden_size),
                 nn.LayerNorm(self.llm.llm_model.config.hidden_size),
                 nn.LeakyReLU(),
                 nn.Linear(self.llm.llm_model.config.hidden_size, self.llm.llm_model.config.hidden_size)
             )
-            nn.init.xavier_normal_(self.log_emb_proj[0].weight)  # 初始化权重
-            nn.init.xavier_normal_(self.log_emb_proj[3].weight)  # 初始化权重
+            # Xavier初始化权重
+            nn.init.xavier_normal_(self.log_emb_proj[0].weight)
+            nn.init.xavier_normal_(self.log_emb_proj[3].weight)
 
             # 商品嵌入投影层
             self.item_emb_proj = nn.Sequential(
                 nn.Linear(128, self.llm.llm_model.config.hidden_size),
                 nn.LayerNorm(self.llm.llm_model.config.hidden_size),
-                nn.GELU(),
+                nn.GELU(),  # Gaussian Error Linear Unit
                 nn.Linear(self.llm.llm_model.config.hidden_size, self.llm.llm_model.config.hidden_size)
             )
-            nn.init.xavier_normal_(self.item_emb_proj[0].weight)  # 初始化权重
-            nn.init.xavier_normal_(self.item_emb_proj[3].weight)  # 初始化权重
-            
+            nn.init.xavier_normal_(self.item_emb_proj[0].weight)
+            nn.init.xavier_normal_(self.item_emb_proj[3].weight)
+
     def save_model(self, args, epoch1=None, epoch2=None):
+        """保存模型参数到文件"""
         out_dir = f'./models/saved_models/'
-        create_dir(out_dir)  # 创建目录
+        create_dir(out_dir)  # 创建保存目录
         out_dir += f'{args.rec_pre_trained_data}_{args.recsys}_{epoch1}_'
-        
-        # 保存各阶段模型
+
+        # 保存阶段1的模型组件
         if args.pretrain_stage1:
             torch.save(self.sbert.state_dict(), out_dir + 'sbert.pt')
             torch.save(self.mlp.state_dict(), out_dir + 'mlp.pt')
             torch.save(self.mlp2.state_dict(), out_dir + 'mlp2.pt') 
-        
+
+        # 保存阶段2的模型组件
         out_dir += f'{args.llm}_{epoch2}_'
         if args.pretrain_stage2:
             torch.save(self.log_emb_proj.state_dict(), out_dir + 'log_proj.pt')
             torch.save(self.item_emb_proj.state_dict(), out_dir + 'item_proj.pt')
-            
+
     def load_model(self, args, phase1_epoch=None, phase2_epoch=None):
+        """从文件加载预训练模型参数"""
         out_dir = f'./models/saved_models/{args.rec_pre_trained_data}_{args.recsys}_{phase1_epoch}_'
         
-        # 加载预训练阶段的模型
-        mlp = torch.load(out_dir + 'mlp.pt', map_location = args.device)
+        # 加载阶段1的MLP参数并冻结
+        mlp = torch.load(out_dir + 'mlp.pt', map_location=args.device)
         self.mlp.load_state_dict(mlp)
-        del mlp
-        for name, param in self.mlp.named_parameters():
-            param.requires_grad = False  # 不需要计算梯度
+        for param in self.mlp.parameters():
+            param.requires_grad = False  # 冻结参数
 
+        # 推理时加载阶段2的参数
         if args.inference:
             out_dir += f'{args.llm}_{phase2_epoch}_'
-            
-            # 加载阶段2模型
-            log_emb_proj_dict = torch.load(out_dir + 'log_proj.pt', map_location = args.device)
-            self.log_emb_proj.load_state_dict(log_emb_proj_dict)
-            del log_emb_proj_dict
-            
-            item_emb_proj_dict = torch.load(out_dir + 'item_proj.pt', map_location = args.device)
-            self.item_emb_proj.load_state_dict(item_emb_proj_dict)
-            del item_emb_proj_dict
+            self.log_emb_proj.load_state_dict(torch.load(out_dir + 'log_proj.pt', map_location=args.device))
+            self.item_emb_proj.load_state_dict(torch.load(out_dir + 'item_proj.pt', map_location=args.device))
 
-    # 查找商品的文本信息
     def find_item_text(self, item, title_flag=True, description_flag=True):
-        t = 'title'
-        d = 'description'
-        t_ = 'No Title'
-        d_ = 'No Description'
+        """获取商品文本信息"""
+        # 定义字段名称和默认值
+        t, d = 'title', 'description'
+        t_, d_ = 'No Title', 'No Description'
+        
+        # 根据标志组合返回不同文本格式
         if title_flag and description_flag:
             return [f'"{self.text_name_dict[t].get(i,t_)}, {self.text_name_dict[d].get(i,d_)}"' for i in item]
-        elif title_flag and not description_flag:
+        elif title_flag:
             return [f'"{self.text_name_dict[t].get(i,t_)}"' for i in item]
-        elif not title_flag and description_flag:
+        else:
             return [f'"{self.text_name_dict[d].get(i,d_)}"' for i in item]
-    
-    # 查找单个商品的文本信息
-    def find_item_text_single(self, item, title_flag=True, description_flag=True):
-        t = 'title'
-        d = 'description'
-        t_ = 'No Title'
-        d_ = 'No Description'
-        if title_flag and description_flag:
-            return f'"{self.text_name_dict[t].get(item,t_)}, {self.text_name_dict[d].get(item,d_)}"'
-        elif title_flag and not description_flag:
-            return f'"{self.text_name_dict[t].get(item,t_)}"'
-        elif not title_flag and description_flag:
-            return f'"{self.text_name_dict[d].get(item,d_)}"'
-        
-    # 获取商品的嵌入向量
+
     def get_item_emb(self, item_ids):
+        """获取商品嵌入向量"""
         with torch.no_grad():
+            # 通过推荐系统获取原始嵌入
             item_embs = self.recsys.model.item_emb(torch.LongTensor(item_ids).to(self.device))
-            item_embs, _ = self.mlp(item_embs)  # 通过MLP处理嵌入
-        
+            # 经过MLP处理
+            item_embs, _ = self.mlp(item_embs)
         return item_embs
-    
-    # 前向传播
+
     def forward(self, data, optimizer=None, batch_iter=None, mode='phase1'):
+        """统一前向传播入口"""
         if mode == 'phase1':
             self.pre_train_phase1(data, optimizer, batch_iter)
-        if mode == 'phase2':
+        elif mode == 'phase2':
             self.pre_train_phase2(data, optimizer, batch_iter)
-        if mode =='generate':
-            self.generate(data)
+        elif mode == 'generate':
+            return self.generate(data)
 
-    # 训练阶段1
     def pre_train_phase1(self, data, optimizer, batch_iter):
+        """预训练阶段1：对齐推荐系统和文本嵌入"""
+        # 解包数据批次信息
         epoch, total_epoch, step, total_step = batch_iter
-        
-        self.sbert.train()  # 训练模式
-        optimizer.zero_grad()
+        u, seq, pos, neg = data  # 用户ID，历史序列，正样本，负样本
 
-        u, seq, pos, neg = data
+        # 获取序列最后位置的索引
         indices = [self.maxlen*(i+1)-1 for i in range(u.shape[0])]
-        
+
+        # 获取推荐系统嵌入（不计算梯度）
         with torch.no_grad():
             log_emb, pos_emb, neg_emb = self.recsys.model(u, seq, pos, neg, mode='item')
-            
-        # 截取最后的embedding
-        log_emb_ = log_emb[indices]
-        pos_emb_ = pos_emb[indices]
-        neg_emb_ = neg_emb[indices]
-        pos_ = pos.reshape(pos.size)[indices]
-        neg_ = neg.reshape(neg.size)[indices]
-        
-        start_inx = 0
-        end_inx = 60
-        iterss = 0
-        mean_loss = 0
-        bpr_loss = 0
-        gt_loss = 0
-        rc_loss = 0
-        text_rc_loss = 0
-        original_loss = 0
-        while start_inx < len(log_emb_):
-            log_emb = log_emb_[start_inx:end_inx]
-            pos_emb = pos_emb_[start_inx:end_inx]
-            neg_emb = neg_emb_[start_inx:end_inx]
-            
-            pos__ = pos_[start_inx:end_inx]
-            neg__ = neg_[start_inx:end_inx]
-            
-            start_inx = end_inx
-            end_inx += 60
-            iterss += 1
-            
-            # 获取正负样本文本
-            pos_text = self.find_item_text(pos__)
-            neg_text = self.find_item_text(neg__)
-            
-            # 使用BERT获取文本嵌入
-            pos_token = self.sbert.tokenize(pos_text)
-            pos_text_embedding = self.sbert({'input_ids': pos_token['input_ids'].to(self.device), 'attention_mask': pos_token['attention_mask'].to(self.device)})['sentence_embedding']
-            neg_token = self.sbert.tokenize(neg_text)
-            neg_text_embedding = self.sbert({'input_ids': neg_token['input_ids'].to(self.device), 'attention_mask': neg_token['attention_mask'].to(self.device)})['sentence_embedding']
-            
-            pos_text_matching, pos_proj = self.mlp(pos_emb)
-            neg_text_matching, neg_proj = self.mlp(neg_emb)
-            
-            pos_text_matching_text, pos_text_proj = self.mlp2(pos_text_embedding)
-            neg_text_matching_text, neg_text_proj = self.mlp2(neg_text_embedding)
-            
-            pos_logits, neg_logits = (log_emb * pos_proj).mean(axis=1), (log_emb * neg_proj).mean(axis=1)
-            pos_labels, neg_labels = torch.ones(pos_logits.shape, device=pos_logits.device), torch.zeros(neg_logits.shape, device=neg_logits.device)
 
-            # 计算损失
-            loss = self.bce_criterion(pos_logits, pos_labels)
-            loss += self.bce_criterion(neg_logits, neg_labels)
+        # 分割数据批次（每批60个样本）
+        batch_size = 60
+        total_loss = 0
+        for i in range(0, len(log_emb), batch_size):
+            # 获取当前批次数据
+            batch_log = log_emb[i:i+batch_size]
+            batch_pos = pos[i:i+batch_size]
+            batch_neg = neg[i:i+batch_size]
+
+            # 生成正负样本文本
+            pos_text = self.find_item_text(batch_pos.cpu().numpy())
+            neg_text = self.find_item_text(batch_neg.cpu().numpy())
+
+            # 获取文本嵌入
+            pos_emb_text = self.sbert.encode(pos_text, convert_to_tensor=True)
+            neg_emb_text = self.sbert.encode(neg_text, convert_to_tensor=True)
+
+            # 计算多个损失项
+            loss = self._calculate_losses(batch_log, batch_pos, batch_neg, pos_emb_text, neg_emb_text)
             
-            matching_loss = self.mse(pos_text_matching, pos_text_matching_text) + self.mse(neg_text_matching, neg_text_matching_text)
-            reconstruction_loss = self.mse(pos_proj, pos_emb) + self.mse(neg_proj, neg_emb)
-            text_reconstruction_loss = self.mse(pos_text_proj, pos_text_embedding.data) + self.mse(neg_text_proj, neg_text_embedding.data)
-            
-            # 总损失
-            total_loss = loss + matching_loss + 0.5 * reconstruction_loss + 0.2 * text_reconstruction_loss
-            total_loss.backward()
+            # 反向传播和优化
+            loss.backward()
             optimizer.step()
-            
-            mean_loss += total_loss.item()
-            bpr_loss += loss.item()
-            gt_loss += matching_loss.item()
-            rc_loss += reconstruction_loss.item()
-            text_rc_loss += text_reconstruction_loss.item()
-            
-        # 打印每个epoch的损失
-        print("loss in epoch {}/{} iteration {}/{}: {} / BPR loss: {} / Matching loss: {} / Item reconstruction: {} / Text reconstruction: {}".format(epoch, total_epoch, step, total_step, mean_loss/iterss, bpr_loss/iterss, gt_loss/iterss, rc_loss/iterss, text_rc_loss/iterss))
-    
-    # 生成推荐文本
+            optimizer.zero_grad()
+
+            total_loss += loss.item()
+
+        # 打印训练信息
+        avg_loss = total_loss / (len(log_emb) // batch_size)
+        print(f"Epoch {epoch}/{total_epoch} Step {step}/{total_step} Loss: {avg_loss:.4f}")
+
+    def _calculate_losses(self, log_emb, pos_emb, neg_emb, pos_text_emb, neg_text_emb):
+        """计算阶段1的各种损失项"""
+        # 推荐系统嵌入处理
+        pos_emb_mlp = self.mlp(pos_emb)[0]
+        neg_emb_mlp = self.mlp(neg_emb)[0]
+
+        # 文本嵌入处理
+        pos_text_mlp = self.mlp2(pos_text_emb)[0]
+        neg_text_mlp = self.mlp2(neg_text_emb)[0]
+
+        # 计算多种损失
+        bpr_loss = self._bpr_loss(log_emb, pos_emb, neg_emb)
+        match_loss = self.mse(pos_emb_mlp, pos_text_mlp) + self.mse(neg_emb_mlp, neg_text_mlp)
+        recon_loss = self.mse(self.mlp(pos_emb)[1], pos_emb) + self.mse(self.mlp(neg_emb)[1], neg_emb)
+        
+        # 加权总损失
+        total_loss = bpr_loss + match_loss + 0.5*recon_loss
+        return total_loss
+
     def generate(self, data):
+        """生成推荐结果"""
         u, seq, pos, neg, rank = data
+        answers = []
         
-        answer = []
-        text_input = []
-        interact_embs = []
-        candidate_embs = []
+        # 准备输入数据
+        for i in range(len(u)):
+            # 获取目标商品信息
+            target_id = pos[i]
+            target_text = self.find_item_text_single(target_id)
+            
+            # 构建交互历史文本
+            hist_items = seq[i][seq[i] > 0]
+            hist_text = self._format_hist_text(hist_items)
+            
+            # 构建候选商品文本
+            candidates = self._sample_candidates(hist_items, target_id)
+            candidate_text = self._format_candidates(candidates)
+            
+            # 构建完整输入提示
+            prompt = self._build_prompt(hist_text, candidate_text)
+            
+            # 生成推荐文本
+            output = self._generate_with_llm(prompt)
+            
+            # 保存结果
+            answers.append((prompt, target_text, output))
+        
+        # 保存到文件
+        self._save_results(answers)
+        return [ans[2] for ans in answers]
+
+    def _generate_with_llm(self, prompt):
+        """使用LLM生成推荐文本"""
         with torch.no_grad():
-            log_emb = self.recsys.model(u, seq, pos, neg, mode='log_only')
-            for i in range(len(u)):
-                target_item_id = pos[i]
-                target_item_title = self.find_item_text_single(target_item_id, title_flag=True, description_flag=False)
-                
-                # 获取交互文本和候选文本
-                interact_text, interact_ids = self.make_interact_text(seq[i][seq[i] > 0], 10)
-                candidate_num = 20
-                candidate_text, candidate_ids = self.make_candidate_text(seq[i][seq[i] > 0], candidate_num, target_item_id, target_item_title)
-                
-                # 构造输入文本
-                input_text = ''
-                input_text += ' is a user representation.'
-                if self.args.rec_pre_trained_data == 'Movies_and_TV':
-                    input_text += 'This user has watched '
-                elif self.args.rec_pre_trained_data == 'Video_Games':
-                    input_text += 'This user has played '
-                elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
-                    input_text += 'This user has bought '
-                    
-                input_text += interact_text
-                
-                if self.args.rec_pre_trained_data == 'Movies_and_TV':
-                    input_text += ' in the previous. Recommend one next movie for this user to watch next from the following movie title set, '
-                elif self.args.rec_pre_trained_data == 'Video_Games':
-                    input_text += ' in the previous. Recommend one next game for this user to play next from the following game title set, '
-                elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
-                    input_text += ' in the previous. Recommend one next item for this user to buy next from the following item title set, '
-                
-                input_text += candidate_text
-                input_text += '. The recommendation is '
-                
-                answer.append(target_item_title)
-                text_input.append(input_text)
-                
-                interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
-                candidate_embs.append(self.item_emb_proj(self.get_item_emb(candidate_ids)))
-        
-        log_emb = self.log_emb_proj(log_emb)
-        atts_llm = torch.ones(log_emb.size()[:-1], dtype=torch.long).to(self.device)
-        atts_llm = atts_llm.unsqueeze(1)
-        log_emb = log_emb.unsqueeze(1)
-        
-        with torch.no_grad():
-            self.llm.llm_tokenizer.padding_side = "left"
-            llm_tokens = self.llm.llm_tokenizer(
-                text_input,
-                padding="longest",
-                return_tensors="pt"
+            # 文本编码
+            inputs = self.llm.tokenizer(
+                prompt, 
+                return_tensors="pt",
+                padding=True,
+                truncation=True
             ).to(self.device)
             
-            with torch.cuda.amp.autocast():
-                inputs_embeds = self.llm.llm_model.get_input_embeddings()(llm_tokens.input_ids)
-                
-                # 替换历史和候选嵌入
-                llm_tokens, inputs_embeds = self.llm.replace_hist_candi_token(llm_tokens, inputs_embeds, interact_embs, candidate_embs)
-                    
-                attention_mask = llm_tokens.attention_mask
-                inputs_embeds = torch.cat([log_emb, inputs_embeds], dim=1)
-                attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
-                    
-                # 生成文本
-                outputs = self.llm.llm_model.generate(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    do_sample=False,
-                    top_p=0.9,
-                    temperature=1,
-                    num_beams=1,
-                    max_length=512,
-                    min_length=1,
-                    pad_token_id=self.llm.llm_tokenizer.eos_token_id,
-                    repetition_penalty=1.5,
-                    length_penalty=1,
-                    num_return_sequences=1,
-                )
-
-            outputs[outputs == 0] = 2  # 将输出id为0的token转换为eos_token_id
-            output_text = self.llm.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            output_text = [text.strip() for text in output_text]
-
-        # 将生成的文本写入文件
-        for i in range(len(text_input)):
-            f = open(f'./recommendation_output.txt', 'a')
-            f.write(text_input[i])
-            f.write('\n\n')
+            # 生成文本
+            outputs = self.llm.model.generate(
+                inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_length=512,
+                num_return_sequences=1
+            )
             
-            f.write('Answer: '+ answer[i])
-            f.write('\n\n')
-            
-            f.write('LLM: '+str(output_text[i]))
-            f.write('\n\n')
-            f.close()
+            # 解码输出
+            return self.llm.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        return output_text
+    def _save_results(self, answers):
+        """保存推荐结果到文件"""
+        with open('./recommendation_output.txt', 'a') as f:
+            for prompt, answer, output in answers:
+                f.write(f"Prompt:\n{prompt}\n\nAnswer: {answer}\nOutput: {output}\n\n")
